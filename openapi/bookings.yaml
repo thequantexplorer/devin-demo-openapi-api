@@ -1,0 +1,337 @@
+openapi: 3.0.3
+info:
+  title: Acme Rooms Bookings API
+  version: 1.0.0
+  description: |
+    Book Acme's meeting rooms, list bookings and cancel them.
+
+    ## Rules for every endpoint
+
+    - Request and response bodies are JSON.
+    - Times are RFC 3339 date-times with a timezone offset, for example
+      `2030-01-15T09:00:00Z` or `2030-01-15T10:00:00+01:00`.
+      Responses always return times in UTC in the format produced by
+      `Date.prototype.toISOString()`, for example `2030-01-15T09:00:00.000Z`.
+    - "Now" means the server clock. Tests inject a fixed clock with
+      `createApp({ clock })`.
+    - Every error response uses the `Error` schema. `error.code` is one of
+      the codes listed for that response.
+    - When a request breaks more than one rule, the server checks the rules in
+      this order and returns the first error: 400, then 404, then 422,
+      then 409.
+
+    ## Rooms
+
+    The rooms are fixed and live in `src/rooms.ts`:
+
+    | id          | capacity |
+    |-------------|----------|
+    | room-alpha  | 4        |
+    | room-beta   | 8        |
+    | room-gamma  | 12       |
+servers:
+  - url: http://localhost:3000
+tags:
+  - name: bookings
+paths:
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      responses:
+        "200":
+          description: The service is up.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status:
+                    type: string
+                    enum: [ok]
+  /bookings:
+    post:
+      operationId: createBooking
+      tags: [bookings]
+      summary: Create a booking
+      description: |
+        Validation rules (all return 400 `validation_error` with one
+        `details` entry per broken rule):
+
+        - The body must be a JSON object with exactly the properties in
+          `CreateBookingRequest`. Unknown properties are rejected.
+        - `guestEmail` must be a valid email address of at most 254 characters.
+        - `partySize` must be an integer from 1 to 50.
+        - `startsAt` and `endsAt` must be RFC 3339 date-times with an offset.
+        - `startsAt` and `endsAt` must fall on a 15-minute boundary
+          (minutes 00, 15, 30 or 45, and zero seconds).
+        - `endsAt` must be after `startsAt`.
+        - The booking must last at least 15 minutes and at most 4 hours.
+
+        A body that is not valid JSON returns 400 `invalid_json`.
+
+        Business rules:
+
+        - 404 `room_not_found` if `roomId` is not one of the rooms.
+        - 422 `capacity_exceeded` if `partySize` is larger than the room's
+          capacity.
+        - 422 `starts_in_past` if `startsAt` is not after now.
+        - 409 `booking_conflict` if the time overlaps an `active` booking for
+          the same room. Two bookings overlap when
+          `a.startsAt < b.endsAt && b.startsAt < a.endsAt`, so back-to-back
+          bookings are allowed. Cancelled bookings never conflict.
+
+        New bookings get the next id in the sequence `bk_1`, `bk_2`, ...
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateBookingRequest"
+            example:
+              roomId: room-beta
+              guestEmail: ada@example.com
+              partySize: 6
+              startsAt: "2030-01-15T09:00:00Z"
+              endsAt: "2030-01-15T10:30:00Z"
+      responses:
+        "201":
+          description: The booking was created.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: "`room_not_found`: the room does not exist."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`booking_conflict`: the room is already booked for part of this time."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: "`capacity_exceeded` or `starts_in_past`."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      operationId: listBookings
+      tags: [bookings]
+      summary: List bookings
+      description: |
+        Returns bookings sorted by `startsAt` ascending, then by `id`
+        (`bk_2` before `bk_10`).
+
+        Query rules (all return 400 `validation_error`):
+
+        - `roomId`, if given, must match `^room-[a-z]+$`. A well-formed id
+          for a room that does not exist returns an empty list.
+        - `status`, if given, must be `active` or `cancelled`.
+        - `limit`, if given, must be an integer from 1 to 100. Default 50.
+
+        Unknown query parameters are ignored.
+      parameters:
+        - name: roomId
+          in: query
+          schema:
+            type: string
+            pattern: "^room-[a-z]+$"
+        - name: status
+          in: query
+          schema:
+            $ref: "#/components/schemas/BookingStatus"
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: The matching bookings.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                additionalProperties: false
+                properties:
+                  data:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Booking"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+  /bookings/{bookingId}/cancel:
+    post:
+      operationId: cancelBooking
+      tags: [bookings]
+      summary: Cancel a booking
+      description: |
+        Rules:
+
+        - 400 `validation_error` if `bookingId` does not match `^bk_[0-9]+$`,
+          or the body has unknown properties, or `reason` is longer than
+          200 characters. The body is optional; an empty body means no reason.
+        - 400 `invalid_json` if the body is not valid JSON.
+        - 404 `booking_not_found` if no booking has this id.
+        - 422 `booking_started` if the booking has already started
+          (`startsAt` is not after now).
+        - 409 `already_cancelled` if the booking is already cancelled.
+
+        On success the booking's `status` becomes `cancelled`, `cancelledAt`
+        is set to now and `cancelReason` to the reason (or `null`).
+      parameters:
+        - name: bookingId
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: "^bk_[0-9]+$"
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CancelBookingRequest"
+      responses:
+        "200":
+          description: The booking was cancelled.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Booking"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          description: "`booking_not_found`: no booking has this id."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "`already_cancelled`: the booking was already cancelled."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "422":
+          description: "`booking_started`: the booking has already started."
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+components:
+  responses:
+    BadRequest:
+      description: "`validation_error` or `invalid_json`."
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+          example:
+            error:
+              code: validation_error
+              message: Request is invalid
+              details:
+                - path: partySize
+                  message: Must be at most 50
+  schemas:
+    BookingStatus:
+      type: string
+      enum: [active, cancelled]
+    CreateBookingRequest:
+      type: object
+      additionalProperties: false
+      required: [roomId, guestEmail, partySize, startsAt, endsAt]
+      properties:
+        roomId:
+          type: string
+        guestEmail:
+          type: string
+          format: email
+          maxLength: 254
+        partySize:
+          type: integer
+          minimum: 1
+          maximum: 50
+        startsAt:
+          type: string
+          format: date-time
+        endsAt:
+          type: string
+          format: date-time
+    CancelBookingRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        reason:
+          type: string
+          maxLength: 200
+    Booking:
+      type: object
+      additionalProperties: false
+      required: [id, roomId, guestEmail, partySize, startsAt, endsAt, status, createdAt, cancelledAt, cancelReason]
+      properties:
+        id:
+          type: string
+          pattern: "^bk_[0-9]+$"
+        roomId:
+          type: string
+        guestEmail:
+          type: string
+        partySize:
+          type: integer
+        startsAt:
+          type: string
+          format: date-time
+        endsAt:
+          type: string
+          format: date-time
+        status:
+          $ref: "#/components/schemas/BookingStatus"
+        createdAt:
+          type: string
+          format: date-time
+        cancelledAt:
+          type: string
+          format: date-time
+          nullable: true
+        cancelReason:
+          type: string
+          nullable: true
+    Error:
+      type: object
+      additionalProperties: false
+      required: [error]
+      properties:
+        error:
+          type: object
+          additionalProperties: false
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
+            details:
+              type: array
+              items:
+                type: object
+                additionalProperties: false
+                required: [path, message]
+                properties:
+                  path:
+                    type: string
+                    description: Dot path to the bad field, for example `partySize` or `query.limit`.
+                  message:
+                    type: string
