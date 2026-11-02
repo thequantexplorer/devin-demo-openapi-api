@@ -1,6 +1,6 @@
 import express from 'express';
 import { BookingStore } from './store';
-import { bookingsRouter } from './routes/bookings';
+import { bookingsRouter, invalidJsonHandler } from './routes/bookings';
 
 export type Clock = () => Date;
 
@@ -22,13 +22,15 @@ export function createApp(options: AppOptions = {}) {
   };
 
   const app = express();
-  app.use(express.json());
+  // strict: false so valid JSON that is not an object (e.g. `[]`, `42`) reaches Zod and gets `validation_error`.
+  app.use(express.json({ strict: false }));
 
   app.get('/health', (_req, res) => {
     res.json({ status: 'ok' });
   });
 
   app.use('/bookings', bookingsRouter(ctx));
+  app.use(invalidJsonHandler);
 
   return app;
 }
